@@ -9,6 +9,51 @@
 #include "microfs.h"
 #include "microfs_internal.h"
 
+static void normalize_path(const char *cwd, const char *input, char *out, size_t out_size) {
+    char combined[1024];
+    combined[0] = '\0';
+
+    if (input[0] == '/') {
+        strncpy(combined, input, sizeof(combined) - 1);
+        combined[sizeof(combined) - 1] = '\0';
+    } else {
+        strncpy(combined, cwd, sizeof(combined) - 1);
+        combined[sizeof(combined) - 1] = '\0';
+        if (strcmp(combined, "/") != 0)
+            strncat(combined, "/", sizeof(combined) - strlen(combined) - 1);
+        strncat(combined, input, sizeof(combined) - strlen(combined) - 1);
+    }
+
+    char work[1024];
+    strncpy(work, combined, sizeof(work) - 1);
+    work[sizeof(work) - 1] = '\0';
+
+    char *segments[256];
+    int seg_count = 0;
+
+    char *saveptr = NULL;
+    char *tok = strtok_r(work, "/", &saveptr);
+    while (tok) {
+        if (strcmp(tok, ".") == 0 || tok[0] == '\0') {
+            /* no-op */
+        } else if (strcmp(tok, "..") == 0) {
+            if (seg_count > 0) seg_count--;
+        } else {
+            segments[seg_count++] = tok;
+        }
+        tok = strtok_r(NULL, "/", &saveptr);
+    }
+
+    if (out_size == 0) return;
+    out[0] = '\0';
+    strncat(out, "/", out_size - 1);
+    for (int i = 0; i < seg_count; i++) {
+        if (strlen(out) > 1)
+            strncat(out, "/", out_size - strlen(out) - 1);
+        strncat(out, segments[i], out_size - strlen(out) - 1);
+    }
+}
+
 /* =============================================
  * Directory entry helpers (internal, but exposed via microfs_internal.h)
  * ============================================= */
@@ -337,20 +382,9 @@ int mfs_chdir(MicroFS *fs, const char *path) {
 
     fs->cwd_inode = res.inode_num;
 
-    if (path[0] == '/') {
-        strncpy(fs->cwd_path, path, sizeof(fs->cwd_path) - 1);
-        /* Normalize trailing slash */
-        int len = strlen(fs->cwd_path);
-        if (len > 1 && fs->cwd_path[len-1] == '/')
-            fs->cwd_path[len-1] = '\0';
-    } else if (strcmp(path, "..") == 0) {
-        char *slash = strrchr(fs->cwd_path, '/');
-        if (slash && slash != fs->cwd_path) *slash = '\0';
-        else strncpy(fs->cwd_path, "/", sizeof(fs->cwd_path) - 1);
-    } else if (strcmp(path, ".") != 0) {
-        if (strcmp(fs->cwd_path, "/") != 0)
-            strncat(fs->cwd_path, "/", sizeof(fs->cwd_path) - strlen(fs->cwd_path) - 1);
-        strncat(fs->cwd_path, path, sizeof(fs->cwd_path) - strlen(fs->cwd_path) - 1);
-    }
+    char normalized[sizeof(fs->cwd_path)];
+    normalize_path(fs->cwd_path, path, normalized, sizeof(normalized));
+    strncpy(fs->cwd_path, normalized, sizeof(fs->cwd_path) - 1);
+    fs->cwd_path[sizeof(fs->cwd_path) - 1] = '\0';
     return MFS_OK;
 }
