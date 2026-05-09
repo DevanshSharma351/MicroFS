@@ -88,6 +88,7 @@ static void print_help(void) {
     printf("    pwd                       print working directory\n");
     printf("    mkdir <path>              create directory\n");
     printf("    rmdir <path>              remove empty directory\n");
+    printf("    rm -r <path>              recursively remove directory and contents\n");
     printf(GREEN "  Links:\n" RESET);
     printf("    ln <src> <dst>            create hard link\n");
     printf("    ln -s <target> <link>     create symbolic link\n");
@@ -808,8 +809,26 @@ void run_shell(MicroFS *fs) {
             else printf(GREEN "OK\n" RESET);
         }
         else if (strcmp(cmd, "rm") == 0) {
-            if (argc < 2) { printf("Usage: rm <path>\n"); continue; }
-            int ret = mfs_unlink(fs, argv[1]);
+            if (argc < 2) { printf("Usage: rm [-r] <path>\n"); continue; }
+            
+            int recursive = 0;
+            const char *target = argv[1];
+            
+            /* Check for -r flag */
+            if (argc > 2 && strcmp(argv[1], "-r") == 0) {
+                recursive = 1;
+                target = argv[2];
+            } else if (argc > 2 && strcmp(argv[2], "-r") == 0) {
+                recursive = 1;
+            }
+            
+            int ret;
+            if (recursive) {
+                ret = mfs_rmdir_recursive(fs, target);
+            } else {
+                ret = mfs_unlink(fs, target);
+            }
+            
             if (ret != MFS_OK) printf(RED "rm: %s\n" RESET, mfs_strerror(ret));
             else printf(GREEN "OK\n" RESET);
         }

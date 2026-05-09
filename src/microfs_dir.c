@@ -322,8 +322,46 @@ int mfs_mkdir(MicroFS *fs, const char *path, uint16_t perms) {
 }
 
 /* =============================================
- * rmdir
+ * rmdir_recursive — Remove directory and all contents
  * ============================================= */
+int mfs_rmdir_recursive(MicroFS *fs, const char *path) {
+    PathResult res;
+    int ret = mfs_resolve_path(fs, path, &res);
+    if (ret != MFS_OK) return ret;
+    if (res.inode.type != INODE_DIR) return MFS_ERR_NOTDIR;
+    if (res.inode_num == fs->sb.root_inode) return MFS_ERR_PERM;
+
+    /* Read directory entries */
+    DirEntry entries[MAX_DIR_ENTRIES * MAX_DIRECT_BLOCKS];
+    int count = 0;
+    dir_read_entries(fs, &res.inode, entries, &count);
+
+    /* Recursively delete all entries (except . and ..) */
+    for (int i = 0; i < count; i++) {
+        if (strcmp(entries[i].name, ".") == 0 || strcmp(entries[i].name, "..") == 0)
+            continue;
+
+        /* Build full path to entry */
+        char full_path[512];
+        snprintf(full_path, sizeof(full_path), "%s/%s", path, entries[i].name);
+
+        Inode entry_inode;
+        mfs_read_inode(fs, entries[i].inode_num, &entry_inode);
+
+        if (entry_inode.type == INODE_DIR) {
+            /* Recursively delete subdirectories */
+            ret = mfs_rmdir_recursive(fs, full_path);
+            if (ret != MFS_OK) return ret;
+        } else if (entry_inode.type == INODE_FILE || entry_inode.type == INODE_SYMLINK) {
+            /* Delete files and symlinks */
+            ret = mfs_unlink(fs, full_path);
+            if (ret != MFS_OK) return ret;
+        }
+    }
+
+    /* Now delete the empty directory */
+    return mfs_rmdir(fs, path);
+}
 int mfs_rmdir(MicroFS *fs, const char *path) {
     PathResult res;
     int ret = mfs_resolve_path(fs, path, &res);

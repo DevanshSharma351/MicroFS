@@ -318,6 +318,48 @@ static void test_readdir(void) {
     mfs_rmdir(&fs, "/mydir");
 }
 
+static void test_rmdir_recursive(void) {
+    SECTION("Recursive Directory Removal");
+
+    /* Create a directory structure */
+    mfs_mkdir(&fs, "/parent", PERM_DEFAULT_DIR);
+    mfs_mkdir(&fs, "/parent/child1", PERM_DEFAULT_DIR);
+    mfs_mkdir(&fs, "/parent/child2", PERM_DEFAULT_DIR);
+    mfs_mkdir(&fs, "/parent/child1/grandchild", PERM_DEFAULT_DIR);
+
+    /* Add files at various levels */
+    mfs_create(&fs, "/parent/file1.txt", PERM_DEFAULT_FILE);
+    mfs_create(&fs, "/parent/child1/file2.txt", PERM_DEFAULT_FILE);
+    mfs_create(&fs, "/parent/child1/grandchild/file3.txt", PERM_DEFAULT_FILE);
+    mfs_create(&fs, "/parent/child2/file4.txt", PERM_DEFAULT_FILE);
+
+    /* Write some data to files */
+    int fd = mfs_open(&fs, "/parent/file1.txt", 1);
+    FileHandle *fh = mfs_get_handle(fd);
+    mfs_write(&fs, fh, "data1", 5);
+    mfs_close(fh);
+
+    /* Test directory exists */
+    Inode inode;
+    int ret = mfs_stat(&fs, "/parent", &inode);
+    TEST("parent directory exists",  ret == MFS_OK);
+
+    /* Recursively remove the entire directory tree */
+    ret = mfs_rmdir_recursive(&fs, "/parent");
+    TEST("rmdir_recursive success",  ret == MFS_OK);
+
+    /* Verify the directory is gone */
+    ret = mfs_stat(&fs, "/parent", &inode);
+    TEST("parent directory removed", ret == MFS_ERR_NOTFOUND);
+
+    /* Verify all files are gone */
+    ret = mfs_stat(&fs, "/parent/file1.txt", &inode);
+    TEST("file1.txt removed",        ret == MFS_ERR_NOTFOUND);
+
+    ret = mfs_stat(&fs, "/parent/child1/grandchild/file3.txt", &inode);
+    TEST("nested file3.txt removed", ret == MFS_ERR_NOTFOUND);
+}
+
 static void test_journal_ops(void) {
     SECTION("Journal Operations");
 
@@ -416,6 +458,7 @@ int main(void) {
     test_bitmap_consistency();
     test_fsck();
     test_readdir();
+    test_rmdir_recursive();
     test_journal_ops();
     test_crash_recovery_simulation();
     teardown();

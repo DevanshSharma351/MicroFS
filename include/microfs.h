@@ -225,6 +225,7 @@ int  mfs_readlink(MicroFS *fs, const char *path, char *buf, uint32_t bufsz);
 /* --- Directory operations --- */
 int  mfs_mkdir(MicroFS *fs, const char *path, uint16_t perms);
 int  mfs_rmdir(MicroFS *fs, const char *path);
+int  mfs_rmdir_recursive(MicroFS *fs, const char *path);
 int  mfs_readdir(MicroFS *fs, const char *path, DirEntry *entries, int *count);
 int  mfs_chdir(MicroFS *fs, const char *path);
 
