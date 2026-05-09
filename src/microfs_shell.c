@@ -28,6 +28,8 @@
 #include <string.h>
 #include <time.h>
 #include <ctype.h>
+#include <unistd.h>
+#include <termios.h>
 #include "microfs.h"
 #include "microfs_internal.h"
 
@@ -81,8 +83,166 @@ static void print_help(void) {
     printf("    df                        show disk usage\n");
     printf("    fsck [-r]                 check/repair filesystem\n");
     printf(GREEN "  Shell:\n" RESET);
+    printf("    clear                     clear the screen\n");
     printf("    help                      show this help\n");
     printf("    exit / quit               exit shell\n\n");
+}
+
+#define MAX_HISTORY 200
+#define MAX_LINE_LEN 1024
+
+static const char *k_shell_commands[] = {
+    "help", "clear", "pwd", "cd", "ls", "mkdir", "rmdir", "touch", "rm",
+    "cat", "write", "append", "stat", "cp", "mv", "truncate", "ln",
+    "readlink", "df", "fsck", "exit", "quit"
+};
+
+static void build_prompt(MicroFS *fs, char *prompt, size_t prompt_len) {
+    snprintf(prompt, prompt_len, BOLD CYAN "microfs:" RESET BOLD BLUE "%s" RESET "$ ", fs->cwd_path);
+}
+
+static void redraw_input(const char *prompt, const char *line) {
+    printf("\r\033[2K%s%s", prompt, line);
+    fflush(stdout);
+}
+
+static int autocomplete_command(const char *prefix, char *out, size_t out_len) {
+    int matches = 0;
+    size_t prefix_len = strlen(prefix);
+    out[0] = '\0';
+
+    for (size_t i = 0; i < sizeof(k_shell_commands) / sizeof(k_shell_commands[0]); i++) {
+        const char *cmd = k_shell_commands[i];
+        if (strncmp(cmd, prefix, prefix_len) == 0) {
+            if (matches == 0) {
+                strncpy(out, cmd, out_len - 1);
+                out[out_len - 1] = '\0';
+            }
+            matches++;
+        }
+    }
+    return matches;
+}
+
+static int read_command_line(MicroFS *fs, char *line, size_t line_len,
+                             char history[][MAX_LINE_LEN], int *history_count) {
+    if (!isatty(STDIN_FILENO)) {
+        if (!fgets(line, (int)line_len, stdin)) return 0;
+        int len = (int)strlen(line);
+        while (len > 0 && (line[len - 1] == '\n' || line[len - 1] == '\r'))
+            line[--len] = '\0';
+        return 1;
+    }
+
+    struct termios oldt, raw;
+    if (tcgetattr(STDIN_FILENO, &oldt) != 0) return 0;
+    raw = oldt;
+    raw.c_lflag &= ~(ICANON | ECHO);
+    raw.c_cc[VMIN] = 1;
+    raw.c_cc[VTIME] = 0;
+    if (tcsetattr(STDIN_FILENO, TCSANOW, &raw) != 0) return 0;
+
+    line[0] = '\0';
+    int len = 0;
+    int hist_pos = *history_count;
+    char current_line[MAX_LINE_LEN];
+    current_line[0] = '\0';
+
+    char prompt[640];
+    build_prompt(fs, prompt, sizeof(prompt));
+    printf("%s", prompt);
+    fflush(stdout);
+
+    for (;;) {
+        unsigned char c;
+        ssize_t n = read(STDIN_FILENO, &c, 1);
+        if (n <= 0) {
+            tcsetattr(STDIN_FILENO, TCSANOW, &oldt);
+            return 0;
+        }
+
+        if (c == '\r' || c == '\n') {
+            printf("\n");
+            break;
+        }
+
+        if (c == 127 || c == 8) {
+            if (len > 0) {
+                line[--len] = '\0';
+                redraw_input(prompt, line);
+            }
+            continue;
+        }
+
+        if (c == 12) { /* Ctrl+L */
+            printf("\033[2J\033[H");
+            redraw_input(prompt, line);
+            continue;
+        }
+
+        if (c == 27) { /* Escape sequences (arrows) */
+            unsigned char seq[2];
+            if (read(STDIN_FILENO, &seq[0], 1) <= 0) continue;
+            if (read(STDIN_FILENO, &seq[1], 1) <= 0) continue;
+            if (seq[0] == '[' && seq[1] == 'A') { /* Up */
+                if (*history_count > 0 && hist_pos > 0) {
+                    if (hist_pos == *history_count) {
+                        strncpy(current_line, line, sizeof(current_line) - 1);
+                        current_line[sizeof(current_line) - 1] = '\0';
+                    }
+                    hist_pos--;
+                    strncpy(line, history[hist_pos], line_len - 1);
+                    line[line_len - 1] = '\0';
+                    len = (int)strlen(line);
+                    redraw_input(prompt, line);
+                }
+            } else if (seq[0] == '[' && seq[1] == 'B') { /* Down */
+                if (hist_pos < *history_count) {
+                    hist_pos++;
+                    if (hist_pos == *history_count) {
+                        strncpy(line, current_line, line_len - 1);
+                        line[line_len - 1] = '\0';
+                    } else {
+                        strncpy(line, history[hist_pos], line_len - 1);
+                        line[line_len - 1] = '\0';
+                    }
+                    len = (int)strlen(line);
+                    redraw_input(prompt, line);
+                }
+            }
+            continue;
+        }
+
+        if (c == '\t') { /* Tab completion for command name */
+            if (strchr(line, ' ') || strchr(line, '\t')) continue;
+
+            char completion[64];
+            int matches = autocomplete_command(line, completion, sizeof(completion));
+            if (matches == 1) {
+                snprintf(line, line_len, "%s ", completion);
+                len = (int)strlen(line);
+                redraw_input(prompt, line);
+            } else if (matches > 1) {
+                printf("\n");
+                for (size_t i = 0; i < sizeof(k_shell_commands) / sizeof(k_shell_commands[0]); i++) {
+                    if (strncmp(k_shell_commands[i], line, strlen(line)) == 0)
+                        printf("%s  ", k_shell_commands[i]);
+                }
+                printf("\n");
+                redraw_input(prompt, line);
+            }
+            continue;
+        }
+
+        if (isprint(c) && len < (int)line_len - 1) {
+            line[len++] = (char)c;
+            line[len] = '\0';
+            redraw_input(prompt, line);
+        }
+    }
+
+    tcsetattr(STDIN_FILENO, TCSANOW, &oldt);
+    return 1;
 }
 
 /* =============================================
@@ -352,21 +512,28 @@ void run_shell(MicroFS *fs) {
     print_banner();
     printf("Type " BOLD "help" RESET " for a list of commands.\n\n");
 
-    char line[1024];
+    char line[MAX_LINE_LEN];
     char *argv[MAX_ARGS];
+    char history[MAX_HISTORY][MAX_LINE_LEN];
+    int history_count = 0;
 
     while (1) {
-        /* Prompt: microfs:/current/path$ */
-        printf(BOLD CYAN "microfs:" RESET BOLD BLUE "%s" RESET "$ ", fs->cwd_path);
-        fflush(stdout);
-
-        if (!fgets(line, sizeof(line), stdin)) break;
-
-        /* Strip trailing newline */
-        int len = strlen(line);
-        while (len > 0 && (line[len-1] == '\n' || line[len-1] == '\r'))
-            line[--len] = '\0';
+        if (!read_command_line(fs, line, sizeof(line), history, &history_count)) break;
+        int len = (int)strlen(line);
         if (len == 0) continue;
+
+        if (history_count == 0 || strcmp(history[history_count - 1], line) != 0) {
+            if (history_count < MAX_HISTORY) {
+                strncpy(history[history_count], line, MAX_LINE_LEN - 1);
+                history[history_count][MAX_LINE_LEN - 1] = '\0';
+                history_count++;
+            } else {
+                for (int i = 1; i < MAX_HISTORY; i++)
+                    strcpy(history[i - 1], history[i]);
+                strncpy(history[MAX_HISTORY - 1], line, MAX_LINE_LEN - 1);
+                history[MAX_HISTORY - 1][MAX_LINE_LEN - 1] = '\0';
+            }
+        }
 
         int argc = tokenize(line, argv);
         if (argc == 0) continue;
@@ -380,6 +547,9 @@ void run_shell(MicroFS *fs) {
         }
         else if (strcmp(cmd, "help") == 0) {
             print_help();
+        }
+        else if (strcmp(cmd, "clear") == 0) {
+            printf("\033[2J\033[H");
         }
         else if (strcmp(cmd, "pwd") == 0) {
             printf("%s\n", fs->cwd_path);
