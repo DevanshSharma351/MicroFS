@@ -30,6 +30,7 @@
 #include <ctype.h>
 #include <unistd.h>
 #include <termios.h>
+#include <signal.h>
 #include "microfs.h"
 #include "microfs_internal.h"
 
@@ -55,6 +56,18 @@ static void print_banner(void) {
     printf(BOLD CYAN "  ╚═╝     ╚═╝╚═╝ ╚═════╝╚═╝  ╚═╝ ╚═════╝ ╚═╝     ╚══════╝\n" RESET);
     printf(DIM "  inode-based virtual filesystem in C  |  v1.0\n" RESET);
     printf("\n");
+}
+
+static void print_shell_intro(void) {
+    print_banner();
+    printf("Type " BOLD "help" RESET " for a list of commands.\n\n");
+}
+
+static void clear_and_repaint_header(void) {
+    /* 2J: clear visible screen, 3J: clear scrollback (supported by most modern terminals). */
+    printf("\033[2J\033[3J\033[H");
+    print_shell_intro();
+    fflush(stdout);
 }
 
 static void print_help(void) {
@@ -90,6 +103,34 @@ static void print_help(void) {
 
 #define MAX_HISTORY 200
 #define MAX_LINE_LEN 1024
+#define MAX_CD_MATCHES 128
+
+static struct termios g_saved_termios;
+static volatile sig_atomic_t g_raw_mode_active = 0;
+
+static void restore_terminal_mode(void) {
+    if (g_raw_mode_active) {
+        tcsetattr(STDIN_FILENO, TCSANOW, &g_saved_termios);
+        g_raw_mode_active = 0;
+    }
+}
+
+static void handle_restore_and_exit(int sig) {
+    restore_terminal_mode();
+    _exit(128 + sig);
+}
+
+static void install_terminal_restore_handlers(void) {
+    static int installed = 0;
+    if (installed) return;
+
+    signal(SIGINT, handle_restore_and_exit);
+    signal(SIGTERM, handle_restore_and_exit);
+    signal(SIGQUIT, handle_restore_and_exit);
+    signal(SIGHUP, handle_restore_and_exit);
+    atexit(restore_terminal_mode);
+    installed = 1;
+}
 
 static const char *k_shell_commands[] = {
     "help", "clear", "pwd", "cd", "ls", "mkdir", "rmdir", "touch", "rm",
@@ -106,22 +147,108 @@ static void redraw_input(const char *prompt, const char *line) {
     fflush(stdout);
 }
 
-static int autocomplete_command(const char *prefix, char *out, size_t out_len) {
+static int collect_command_matches(const char *prefix, size_t *matched_idx, size_t max_idx) {
     int matches = 0;
     size_t prefix_len = strlen(prefix);
-    out[0] = '\0';
 
     for (size_t i = 0; i < sizeof(k_shell_commands) / sizeof(k_shell_commands[0]); i++) {
-        const char *cmd = k_shell_commands[i];
-        if (strncmp(cmd, prefix, prefix_len) == 0) {
-            if (matches == 0) {
-                strncpy(out, cmd, out_len - 1);
-                out[out_len - 1] = '\0';
-            }
+        if (strncmp(k_shell_commands[i], prefix, prefix_len) == 0) {
+            if ((size_t)matches < max_idx)
+                matched_idx[matches] = i;
             matches++;
         }
     }
     return matches;
+}
+
+static void longest_common_prefix(char *out, size_t out_len,
+                                  size_t *matched_idx, int matches) {
+    out[0] = '\0';
+    if (matches <= 0 || out_len == 0) return;
+
+    strncpy(out, k_shell_commands[matched_idx[0]], out_len - 1);
+    out[out_len - 1] = '\0';
+
+    for (int m = 1; m < matches; m++) {
+        const char *cmd = k_shell_commands[matched_idx[m]];
+        size_t j = 0;
+        while (out[j] && cmd[j] && out[j] == cmd[j]) j++;
+        out[j] = '\0';
+    }
+}
+
+static void longest_common_prefix_strs(char *out, size_t out_len,
+                                       char matches[][MAX_FILENAME], int count) {
+    out[0] = '\0';
+    if (count <= 0 || out_len == 0) return;
+
+    strncpy(out, matches[0], out_len - 1);
+    out[out_len - 1] = '\0';
+
+    for (int m = 1; m < count; m++) {
+        size_t j = 0;
+        while (out[j] && matches[m][j] && out[j] == matches[m][j]) j++;
+        out[j] = '\0';
+    }
+}
+
+static int collect_cd_matches(MicroFS *fs, const char *arg,
+                              char matches[][MAX_FILENAME], int max_matches,
+                              char *base_prefix, size_t base_prefix_len,
+                              char *name_prefix, size_t name_prefix_len) {
+    char dir_path[512];
+    const char *slash = strrchr(arg, '/');
+
+    if (!slash) {
+        strncpy(dir_path, fs->cwd_path, sizeof(dir_path) - 1);
+        dir_path[sizeof(dir_path) - 1] = '\0';
+        base_prefix[0] = '\0';
+        strncpy(name_prefix, arg, name_prefix_len - 1);
+        name_prefix[name_prefix_len - 1] = '\0';
+    } else {
+        size_t base_len = (size_t)(slash - arg) + 1; /* keep trailing slash */
+        if (base_len >= base_prefix_len) base_len = base_prefix_len - 1;
+        strncpy(base_prefix, arg, base_len);
+        base_prefix[base_len] = '\0';
+
+        strncpy(name_prefix, slash + 1, name_prefix_len - 1);
+        name_prefix[name_prefix_len - 1] = '\0';
+
+        if (base_len == 1 && base_prefix[0] == '/') {
+            strncpy(dir_path, "/", sizeof(dir_path) - 1);
+            dir_path[sizeof(dir_path) - 1] = '\0';
+        } else {
+            size_t dir_len = base_len - 1; /* strip trailing slash */
+            if (dir_len >= sizeof(dir_path)) dir_len = sizeof(dir_path) - 1;
+            strncpy(dir_path, base_prefix, dir_len);
+            dir_path[dir_len] = '\0';
+        }
+    }
+
+    DirEntry entries[MAX_DIR_ENTRIES * MAX_DIRECT_BLOCKS];
+    int count = 0;
+    int ret = mfs_readdir(fs, dir_path, entries, &count);
+    if (ret != MFS_OK) return 0;
+
+    int found = 0;
+    size_t prefix_len = strlen(name_prefix);
+    for (int i = 0; i < count && found < max_matches; i++) {
+        if (strcmp(entries[i].name, ".") == 0 || strcmp(entries[i].name, "..") == 0)
+            continue;
+        if (strncmp(entries[i].name, name_prefix, prefix_len) != 0)
+            continue;
+
+        Inode inode;
+        if (mfs_read_inode(fs, entries[i].inode_num, &inode) != MFS_OK)
+            continue;
+        if (inode.type != INODE_DIR)
+            continue;
+
+        strncpy(matches[found], entries[i].name, MAX_FILENAME - 1);
+        matches[found][MAX_FILENAME - 1] = '\0';
+        found++;
+    }
+    return found;
 }
 
 static int read_command_line(MicroFS *fs, char *line, size_t line_len,
@@ -137,10 +264,12 @@ static int read_command_line(MicroFS *fs, char *line, size_t line_len,
     struct termios oldt, raw;
     if (tcgetattr(STDIN_FILENO, &oldt) != 0) return 0;
     raw = oldt;
-    raw.c_lflag &= ~(ICANON | ECHO);
+    raw.c_lflag &= ~(ICANON | ECHO | ISIG);
     raw.c_cc[VMIN] = 1;
     raw.c_cc[VTIME] = 0;
+    g_saved_termios = oldt;
     if (tcsetattr(STDIN_FILENO, TCSANOW, &raw) != 0) return 0;
+    g_raw_mode_active = 1;
 
     line[0] = '\0';
     int len = 0;
@@ -157,7 +286,7 @@ static int read_command_line(MicroFS *fs, char *line, size_t line_len,
         unsigned char c;
         ssize_t n = read(STDIN_FILENO, &c, 1);
         if (n <= 0) {
-            tcsetattr(STDIN_FILENO, TCSANOW, &oldt);
+            restore_terminal_mode();
             return 0;
         }
 
@@ -166,16 +295,30 @@ static int read_command_line(MicroFS *fs, char *line, size_t line_len,
             break;
         }
 
+        if (c == 3) { /* Ctrl+C: cancel current input line */
+            line[0] = '\0';
+            printf("^C\n");
+            restore_terminal_mode();
+            return 1;
+        }
+
+        if (c == 4) { /* Ctrl+D: exit shell */
+            printf("\n");
+            restore_terminal_mode();
+            return 0;
+        }
+
         if (c == 127 || c == 8) {
             if (len > 0) {
                 line[--len] = '\0';
-                redraw_input(prompt, line);
+                printf("\b \b");
+                fflush(stdout);
             }
             continue;
         }
 
         if (c == 12) { /* Ctrl+L */
-            printf("\033[2J\033[H");
+            clear_and_repaint_header();
             redraw_input(prompt, line);
             continue;
         }
@@ -214,22 +357,99 @@ static int read_command_line(MicroFS *fs, char *line, size_t line_len,
         }
 
         if (c == '\t') { /* Tab completion for command name */
-            if (strchr(line, ' ') || strchr(line, '\t')) continue;
+            size_t cmd_len = strcspn(line, " \t");
+            if (cmd_len == strlen(line)) {
+                /* Complete command name when typing first token. */
+                char token[64];
+                if (cmd_len >= sizeof(token)) cmd_len = sizeof(token) - 1;
+                strncpy(token, line, cmd_len);
+                token[cmd_len] = '\0';
 
-            char completion[64];
-            int matches = autocomplete_command(line, completion, sizeof(completion));
-            if (matches == 1) {
-                snprintf(line, line_len, "%s ", completion);
-                len = (int)strlen(line);
-                redraw_input(prompt, line);
-            } else if (matches > 1) {
-                printf("\n");
-                for (size_t i = 0; i < sizeof(k_shell_commands) / sizeof(k_shell_commands[0]); i++) {
-                    if (strncmp(k_shell_commands[i], line, strlen(line)) == 0)
-                        printf("%s  ", k_shell_commands[i]);
+                size_t matched_idx[64];
+                int matches = collect_command_matches(token, matched_idx,
+                    sizeof(matched_idx) / sizeof(matched_idx[0]));
+
+                if (matches == 0) {
+                    printf("\a");
+                    fflush(stdout);
+                    continue;
                 }
-                printf("\n");
-                redraw_input(prompt, line);
+
+                if (matches == 1) {
+                    snprintf(line, line_len, "%s ", k_shell_commands[matched_idx[0]]);
+                    len = (int)strlen(line);
+                    redraw_input(prompt, line);
+                } else {
+                    char lcp[64];
+                    longest_common_prefix(lcp, sizeof(lcp), matched_idx, matches);
+                    if (strlen(lcp) > strlen(token)) {
+                        snprintf(line, line_len, "%s", lcp);
+                        len = (int)strlen(line);
+                    }
+                    printf("\n");
+                    for (int i = 0; i < matches; i++) {
+                        printf("%s  ", k_shell_commands[matched_idx[i]]);
+                    }
+                    printf("\n");
+                    redraw_input(prompt, line);
+                }
+                continue;
+            }
+
+            /* Path completion for: cd <arg> */
+            char cmd[32];
+            size_t cpy_len = cmd_len >= sizeof(cmd) ? sizeof(cmd) - 1 : cmd_len;
+            strncpy(cmd, line, cpy_len);
+            cmd[cpy_len] = '\0';
+
+            if (strcmp(cmd, "cd") == 0) {
+                const char *p = line + cmd_len;
+                while (*p == ' ' || *p == '\t') p++;
+                size_t arg_offset = (size_t)(p - line);
+
+                size_t arg_len = strcspn(p, " \t");
+                if (p[arg_len] != '\0') continue; /* only complete first argument */
+
+                char arg[512];
+                if (arg_len >= sizeof(arg)) arg_len = sizeof(arg) - 1;
+                strncpy(arg, p, arg_len);
+                arg[arg_len] = '\0';
+
+                char matches[MAX_CD_MATCHES][MAX_FILENAME];
+                char base_prefix[512], name_prefix[MAX_FILENAME];
+                int mcount = collect_cd_matches(fs, arg, matches, MAX_CD_MATCHES,
+                                               base_prefix, sizeof(base_prefix),
+                                               name_prefix, sizeof(name_prefix));
+                if (mcount == 0) {
+                    printf("\a");
+                    fflush(stdout);
+                    continue;
+                }
+
+                char oldline[MAX_LINE_LEN];
+                strncpy(oldline, line, sizeof(oldline) - 1);
+                oldline[sizeof(oldline) - 1] = '\0';
+
+                if (mcount == 1) {
+                    snprintf(line, line_len, "%.*s%s%s/", (int)arg_offset, oldline,
+                             base_prefix, matches[0]);
+                    len = (int)strlen(line);
+                    redraw_input(prompt, line);
+                } else {
+                    char lcp[MAX_FILENAME];
+                    longest_common_prefix_strs(lcp, sizeof(lcp), matches, mcount);
+                    if (strlen(lcp) > strlen(name_prefix)) {
+                        snprintf(line, line_len, "%.*s%s%s", (int)arg_offset, oldline,
+                                 base_prefix, lcp);
+                        len = (int)strlen(line);
+                    }
+
+                    printf("\n");
+                    for (int i = 0; i < mcount; i++)
+                        printf("%s/  ", matches[i]);
+                    printf("\n");
+                    redraw_input(prompt, line);
+                }
             }
             continue;
         }
@@ -237,11 +457,12 @@ static int read_command_line(MicroFS *fs, char *line, size_t line_len,
         if (isprint(c) && len < (int)line_len - 1) {
             line[len++] = (char)c;
             line[len] = '\0';
-            redraw_input(prompt, line);
+            putchar((char)c);
+            fflush(stdout);
         }
     }
 
-    tcsetattr(STDIN_FILENO, TCSANOW, &oldt);
+    restore_terminal_mode();
     return 1;
 }
 
@@ -509,8 +730,8 @@ static void join_args(char *argv[], int start, int argc, char *out, int outlen) 
  * Main shell loop
  * ============================================= */
 void run_shell(MicroFS *fs) {
-    print_banner();
-    printf("Type " BOLD "help" RESET " for a list of commands.\n\n");
+    install_terminal_restore_handlers();
+    print_shell_intro();
 
     char line[MAX_LINE_LEN];
     char *argv[MAX_ARGS];
@@ -549,7 +770,7 @@ void run_shell(MicroFS *fs) {
             print_help();
         }
         else if (strcmp(cmd, "clear") == 0) {
-            printf("\033[2J\033[H");
+            clear_and_repaint_header();
         }
         else if (strcmp(cmd, "pwd") == 0) {
             printf("%s\n", fs->cwd_path);
